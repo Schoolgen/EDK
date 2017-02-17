@@ -1,0 +1,701 @@
+// EDK v1.0
+// Adafruit Huzzah Feather 8266 board
+// Temp, Humidity & Light sensors with 3 bicolour LED indicators
+// Connects to internet and publishes data to my io.adafruit account using mqtt
+
+/****************************************************/
+// Temperature & humidity sensor (DHT22) sensor code modified from LadyAda, public domain
+#include <DHT.h>
+/****************************************************/
+#define DHTTYPE DHT22 // note- sensor data wire needs a 10K resistor to 3.3V
+#define DHTPIN 0     // GPIO pin 0 for digital input (was pin 4)
+/****************************************************/
+DHT dht(DHTPIN, DHTTYPE, 11); // 11 works fine for ESP8266 (depends on speed of board used)
+/****************************************************/
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_TSL2561_U.h>
+Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);
+
+/*
+   TSL2561 light sensor Connections
+   ===========
+   Connect SCL to analog 5
+   Connect SDA to analog 4
+   Connect VDD to 3.3V DC
+   Connect GROUND to common ground
+*/
+
+
+//Setup LED indicator pins for Adafruit Feather board
+// ** bi-colour Temperature LED
+const int Tred_ledPin =  14;        // connect to pin 14 on board
+const int Tgreen_ledPin =  12;      // connect to pin 12
+int Tr_ledState = LOW;             // ledState used to set the LED
+int Tg_ledState = LOW;             // ledState used to set the LED
+
+//** Humidity LED (bi-colour)
+const int Hred_ledPin =  13;        // pin of the Humidity LED
+const int Hgreen_ledPin =  15;      // pin of the Humidity LED - needs to be LOW on startup
+int Hr_ledState = LOW;             // ledState used to set the LED
+int Hg_ledState = LOW;             // ledState used to set the LED
+
+// ** Lux LED setup
+const int Lred_ledPin =  16;      // pin of the Lux LED
+const int Lgreen_ledPin = 2;      // pin of the Lux LED
+int Lr_ledState = LOW;             // ledState used to set the LED
+int Lg_ledState = LOW;             // ledState used to set the LED
+
+// ** Analogue light sensor setup eg TEMT6000
+//const int light_pin = A0 ;        // analog input pin (ADC) for light sensor
+
+// ** TSL2561 integrated light sensor
+
+
+/****************************************************/
+boolean LEDTon ; // use this to decide if LED for TEMP indicator should be on or off
+boolean LEDHon ; // use this to decide if LED for HUMID indicator should be on or off
+boolean LEDLon ; // use this to decide if LED for HUMID indicator should be on or off
+
+boolean LEDT_blink_slow;
+boolean LEDT_blink_fast;
+boolean LEDH_blink_slow;
+boolean LEDH_blink_fast;
+boolean LEDL_blink_slow;
+boolean LEDL_blink_fast;
+
+boolean sampleHigh ; // use this to decide if sample rate to be high (every few secs) or low (every 15 mins = 900 secs) - variable to use sampFreq
+
+/****************************************************/
+// Generally, you should use "unsigned long" for variables that hold time - the value will quickly become too large for an int to store
+unsigned long previousMillis = 0;        // will store last time sensors were read (fn called)
+const long interval_short = 10000;        // interval at which to read sensors (milliseconds) ie 10 seconds
+const long interval_long = 1800000;       // 1800 seconds = 30 minutes
+
+/****************************************************/
+#include <ESP8266WiFi.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+
+/************************* WiFi Access Point *********************************/
+
+#define WLAN_SSID      "vodafoneB976"  //"AndroidAPwork" // "AndroidAP"  // "vodafoneB976" 
+#define WLAN_PASS       "87179372" //"cuqy0820"   // "psba9029" // "87179372"
+
+/************************* Adafruit.io Setup *********************************/
+#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVERPORT  1883
+#define AIO_USERNAME    "robd689"
+#define AIO_KEY         "3989fa52db4846acbc6fe0e77255e1bd"
+
+/************ Global State (you don't need to change this!) ******************/
+
+// Create an ESP8266 WiFiClient class to connect to the MQTT server.
+WiFiClient client;
+// or... use WiFiFlientSecure for SSL
+//WiFiClientSecure client;
+// Setup the MQTT client class by passing in the WiFi client and MQTT server and login details.
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+
+/****************************** Feeds ***************************************/
+// Setup feed variables for publishing
+// Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
+Adafruit_MQTT_Publish temp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/temp");
+Adafruit_MQTT_Publish humid = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/humid");
+Adafruit_MQTT_Publish light = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/light");
+
+// Setup a feed called 'onoff' for subscribing to changes.
+Adafruit_MQTT_Subscribe onoffbutton1 = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/onoff");  //SUBscribe setup - control LED T - recieves on or off
+Adafruit_MQTT_Subscribe onoffbutton2 = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/onoffH");  //SUBscribe setup - control LED H - receives
+Adafruit_MQTT_Subscribe onoffbutton3 = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/sample");  //SUBscribe setup - control sample rate - receives f_HIGH or f_LOW
+Adafruit_MQTT_Subscribe onoffbutton4 = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/onoffL");  //SUBscribe setup - control LED L - recieves on or off
+
+/*************************** Sketch Code ************************************/
+
+// Bug workaround for Arduino 1.6.6, it seems to need a function declaration
+// for some reason (only affects ESP8266, likely an arduino-builder bug).
+void MQTT_connect();
+
+void setup() {
+  sampleHigh = true ; //default sample rate will be interval_long (30 minutes)
+  LEDTon = true ;
+  LEDHon = true ;
+  LEDLon = true ;
+  LEDT_blink_slow = false;
+  LEDT_blink_fast = false;
+  LEDH_blink_slow = false;
+  LEDH_blink_fast = false;
+  LEDL_blink_slow = false;
+  LEDL_blink_fast = false;
+
+  // LED indicators : Temperature
+  // set the digital pin as output:
+  pinMode(Tred_ledPin, OUTPUT);
+  pinMode(Tgreen_ledPin, OUTPUT);
+  digitalWrite(Tred_ledPin, LOW);
+  digitalWrite(Tgreen_ledPin, LOW);
+
+  // LED indicators : Humidity
+  pinMode(Hred_ledPin, OUTPUT);
+  pinMode(Hgreen_ledPin, OUTPUT);
+  // set the LED with the ledState of the variable:
+  digitalWrite(Hred_ledPin, LOW);
+  digitalWrite(Hgreen_ledPin, LOW);
+
+  // LED indicators : Light
+  pinMode(Lred_ledPin, OUTPUT);
+  pinMode(Lgreen_ledPin, OUTPUT);
+  // set the LED with the ledState of the variable:
+  digitalWrite(Lred_ledPin, LOW);
+  digitalWrite(Lgreen_ledPin, LOW);
+
+  // ** Light sensor TSL2561
+  // initialise and configure by calling this function:
+  configureLux_Sensor();
+
+  // DHT
+  Serial.begin(115200);
+
+  Serial.println("DHT sensor begin: ");
+  dht.begin();
+  delay(100);
+
+  Serial.println(F("Adafruit MQTT starting "));
+
+  // Connect to WiFi access point.
+  Serial.println(); Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(WLAN_SSID);
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Setup MQTT subscription for onoff feed.
+  mqtt.subscribe(&onoffbutton1); // for T LED control
+  mqtt.subscribe(&onoffbutton2); // for H LED control
+  mqtt.subscribe(&onoffbutton3); // for sample frequency (f_HIGH, f_LOW)
+  mqtt.subscribe(&onoffbutton4); // for L LED control
+
+  /*
+    //Take one set of initial readings
+    T_myDHTread() ;
+    delay(10);
+    H_myDHTread() ;
+    delay(10);
+    Light_read() ;
+    delay(10);
+
+    MQTT_connect() ; // connect to enable first sensors readings to be sent
+    delay(5000) ;
+  */
+
+  Serial.println("Setup finished ... ");
+} // end of setup function
+
+void loop() {
+
+  // Ensure the connection to the MQTT server is alive (this will make the first
+  // connection and automatically reconnect when disconnected).  See the MQTT_connect
+  // function definition further below.
+  MQTT_connect() ;
+
+  // SUBscribe
+  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(5000))) {
+
+    if (subscription == &onoffbutton1) { //controls temperature LED
+      //note- pass Flash-memory based strings to Serial.print() by wrapping them with F()
+      Serial.print(F("Got: "));
+      Serial.println((char *)onoffbutton1.lastread); // reads as OFF or ON
+
+      // This stub modified from Adafruit examples - witten by Tony DiCola for Adafruit Industries.
+      if (strcmp((char *)onoffbutton1.lastread, "ON_T") == 0) { //compare two strings (strcmp) to see if they are equal
+        Serial.println("Loop: turn LED T ON");
+        LEDTon = true ; // note- single equals sign to change its state
+        digitalWrite(Tred_ledPin, LOW);
+        digitalWrite(Tgreen_ledPin, HIGH);
+      }
+      if (strcmp((char *)onoffbutton1.lastread, "OFF_T") == 0) {
+        Serial.println("Loop: turn LED T OFF");
+        LEDTon = false ;
+        digitalWrite(Tred_ledPin, LOW);
+        digitalWrite(Tgreen_ledPin, LOW);
+      }
+    } // end of onoffbutton1 IF
+
+    if (subscription == &onoffbutton2) { //controls humidity LED
+      Serial.print(F("Got: "));
+      Serial.println((char *)onoffbutton2.lastread); // reads as OFF or ON
+
+      if (strcmp((char *)onoffbutton2.lastread, "ON_H") == 0) { //compare two strings (strcmp) to see if they are equal
+        Serial.println("Loop: turn LED H ON");
+        LEDHon = true ; // note- single equals sign to change its state
+        digitalWrite(Hred_ledPin, LOW);
+        digitalWrite(Hgreen_ledPin, HIGH);
+      }
+      if (strcmp((char *)onoffbutton2.lastread, "OFF_H") == 0) {
+        Serial.println("Loop: turn LED H OFF");
+        LEDHon = false ;
+        digitalWrite(Hred_ledPin, LOW);
+        digitalWrite(Hgreen_ledPin, LOW);
+      }
+    } // end of onoffbutton2 IF
+
+    if (subscription == &onoffbutton4) { //controls Light LED
+      Serial.print(F("Got: "));
+      Serial.println((char *)onoffbutton4.lastread); // reads as OFF or ON
+
+      if (strcmp((char *)onoffbutton4.lastread, "ON_L") == 0) { //compare two strings (strcmp) to see if they are equal
+        Serial.println("Loop: turn LED L ON");
+        LEDLon = true ; // note- single equals sign to change its state
+        digitalWrite(Lred_ledPin, LOW);
+        digitalWrite(Lgreen_ledPin, HIGH);
+      }
+      if (strcmp((char *)onoffbutton4.lastread, "OFF_L") == 0) {
+        Serial.println("Loop: turn LED L OFF");
+        LEDLon = false ;
+        digitalWrite(Lred_ledPin, LOW);
+        digitalWrite(Lgreen_ledPin, LOW);
+      }
+    } // end of onoffbutton4 if
+
+    if (subscription == &onoffbutton3) { //controls sample rate for sensors
+      //note- pass Flash-memory based strings to Serial.print() by wrapping them with F()
+      Serial.print(F("Got: "));
+      Serial.println((char *)onoffbutton3.lastread); // reads as OFF or ON
+
+      // This stub modified from Adafruit examples - witten by Tony DiCola for Adafruit Industries.
+      if (strcmp((char *)onoffbutton3.lastread, "f_LOW") == 0) { //compare two strings (strcmp) to see if they are equal
+        Serial.println("Loop: set sample freq to LOW (15 mins)");
+        sampleHigh = false ;
+      }
+      if (strcmp((char *)onoffbutton3.lastread, "f_HIGH") == 0) {
+        Serial.println("Loop: set sample freq to HIGH (10 seconds)");
+        sampleHigh = true ;
+      }
+    } // end of onoffbutton3 IF
+  } // end of 'while'
+
+  //Read sensors without delay:
+  unsigned long currentMillis = millis();
+  if (sampleHigh == true) {
+    if (currentMillis - previousMillis >= interval_short ) { // sample sensors
+      // save the last time
+      previousMillis = currentMillis;
+      // read all the sensors
+      T_myDHTread() ;
+      delay(10);
+      H_myDHTread() ;
+      delay(10);
+      Light_read() ;
+      Serial.println("Loop: Sensors read every 10 seconds ! ");
+
+    } // end of sample sensors (high frequency)
+  } else if (sampleHigh == false) {
+    if (currentMillis - previousMillis >= interval_long ) { // sample sensors
+      // save the last time
+      previousMillis = currentMillis;
+      // read all the sensors
+      T_myDHTread() ;
+      delay(10);
+      H_myDHTread() ;
+      delay(10);
+      Light_read() ;
+      Serial.println("Loop: Sensors read every 30 minutes ! ");
+    } // end of sample sensors (high frequency)
+  }
+
+  //BLINKING BEHAVIOURS OF LEDs
+  // LED Temp blink based on true/false flags set in sensor read functions
+  if (LEDTon == true) {
+    if (LEDT_blink_slow == true) {
+      // Tg_ledState & Tr_ledState set in LED behaviour
+      digitalWrite(Tred_ledPin, LOW); // turn off
+      digitalWrite(Tgreen_ledPin, LOW);
+      delay(1200);
+      Serial.println("Slow Blink T");
+      digitalWrite(Tred_ledPin, Tr_ledState); // turn back to previous state
+      digitalWrite(Tgreen_ledPin, Tg_ledState);
+    }
+    else if (LEDT_blink_fast == true) {
+      // Tg_ledState & Tr_ledState set in LED behaviour
+      digitalWrite(Tred_ledPin, LOW); // turn off
+      digitalWrite(Tgreen_ledPin, LOW);
+      delay(200);
+      Serial.println("Fast Blink T ");
+      digitalWrite(Tred_ledPin, Tr_ledState); // turn back to previous state
+      digitalWrite(Tgreen_ledPin, Tg_ledState);
+    }
+    else if (LEDT_blink_fast == false && LEDT_blink_slow == false) {
+      // do nothing ie dont interrupt state of LED pins
+      Serial.println("No Blink T");
+    }
+  }
+
+  // LED Humid blink based on true/false flags set in sensor read functions
+  if (LEDHon == true) {
+    if (LEDH_blink_slow == true) {
+      // Tg_ledState & Tr_ledState set in LED behaviour
+      digitalWrite(Hred_ledPin, LOW); // turn off
+      digitalWrite(Hgreen_ledPin, LOW);
+      delay(1200);
+      Serial.println("Slow Blink H ");
+      digitalWrite(Hred_ledPin, Hr_ledState); // turn back to previous state
+      digitalWrite(Hgreen_ledPin, Hg_ledState);
+    }
+    else if (LEDH_blink_fast == true) {
+      // Tg_ledState & Tr_ledState set in LED behaviour
+      digitalWrite(Hred_ledPin, LOW); // turn off
+      digitalWrite(Hgreen_ledPin, LOW);
+      delay(200);
+      Serial.println("Fast Blink H ");
+      digitalWrite(Hred_ledPin, Hr_ledState); // turn back to previous state
+      digitalWrite(Hgreen_ledPin, Hg_ledState);
+    }
+    else if (LEDH_blink_fast == false && LEDH_blink_slow == false) {
+      // do nothing ie dont interrupt state of LED pins
+      Serial.println("No Blink H ");
+    }
+  }
+  // LED Lux blink based on true/false flags set in sensor read functions
+  if (LEDLon == true) {
+    if (LEDL_blink_slow == true) {
+      // Tg_ledState & Tr_ledState set in LED behaviour
+      digitalWrite(Lred_ledPin, LOW); // turn off
+      digitalWrite(Lgreen_ledPin, LOW);
+      delay(1200);
+      Serial.println("Slow Blink L ");
+      digitalWrite(Lred_ledPin, Lr_ledState); // turn back to previous state
+      digitalWrite(Lgreen_ledPin, Lg_ledState);
+    }
+    else if (LEDL_blink_fast == true) {
+      // Tg_ledState & Tr_ledState set in LED behaviour
+      digitalWrite(Lred_ledPin, LOW); // turn off
+      digitalWrite(Lgreen_ledPin, LOW);
+      delay(200);
+      Serial.println("Fast Blink L ");
+      digitalWrite(Lred_ledPin, Lr_ledState); // turn back to previous state
+      digitalWrite(Lgreen_ledPin, Lg_ledState);
+    }
+    else if (LEDL_blink_fast == false && LEDL_blink_slow == false) {
+      // do nothing ie dont interrupt state of LED pins
+      Serial.println("No Blink L");
+    }
+  }
+} // end of loop function
+
+void configureLux_Sensor(void)
+{
+  /* Initialise the sensor */
+  if (!tsl.begin())
+  {
+    /* There was a problem detecting the ADXL345 ... check your connections */
+    Serial.print("Ooops, no TSL2561 detected ... Check your wiring or I2C ADDR!");
+    while (1);
+  }
+  /* You can also manually set the gain or enable auto-gain support */
+  // tsl.setGain(TSL2561_GAIN_1X);      /* No gain ... use in bright light to avoid sensor saturation */
+  // tsl.setGain(TSL2561_GAIN_16X);     /* 16x gain ... use in low light to boost sensitivity */
+  tsl.enableAutoRange(true);            /* Auto-gain ... switches automatically between 1x and 16x */
+
+  /* Changing the integration time gives you better sensor resolution (402ms = 16-bit data) */
+  // tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_13MS);
+  tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_101MS);
+  // tsl.setIntegrationTime(TSL2561_INTEGRATIONTIME_402MS);
+  /* 16-bit data but slowest conversions */
+} // end of light config
+
+// Put into loop() if needed- ping the server to keep the mqtt connection alive
+// NOT required if you are publishing once every KEEPALIVE seconds
+/*
+  if(! mqtt.ping()) {
+  mqtt.disconnect();
+  }
+*/
+
+void T_myDHTread() {
+  // Reading temperature or humidity takes about 250 milliseconds!
+  // Sensor readings may also be up to 2 seconds 'old' (its a slow sensor)
+  float tmp = dht.readTemperature();
+
+  if (isnan(tmp)) {
+    Serial.println("Failed to read from DHT");
+  } else {
+    Serial.print("Temperature: ");
+    Serial.print(tmp);
+    Serial.println(" *C");
+  }
+
+  //int tmp_10 = (int)(tmp * 10) ; // casting a float as an int - truncates not rounds
+  //Serial.println(tmp_10);
+  // float tmp_1dp =  (tmp_10 / 10.0); // round float to a 1 d.p.? - always gives 2.dp??
+
+  Serial.println(tmp);
+  // PUBlish
+  if (! temp.publish(tmp)) {
+    Serial.println(F("Temp publish Failed"));
+  } else {          // if temp.publish of tmp is successful then print T OK!
+    Serial.println(F("Temp published OK!"));
+  }
+
+
+  if (LEDTon == false) {
+    Serial.println("T function: LED OFF");
+    // dont do anything else
+  }
+  else if (LEDTon == true) {
+    Serial.println("T function: LED ON");
+    //Determine LED colour from Temperature and set the boolean flags to affect blinking behaviour in the loop fn
+    if (tmp < 18) {
+      LEDT_blink_slow = true;
+      LEDT_blink_fast = false;
+      Tr_ledState = HIGH ;
+      Tg_ledState = LOW ;
+      digitalWrite(Tred_ledPin, Tr_ledState);
+      digitalWrite(Tgreen_ledPin, Tg_ledState);
+    } else if (tmp >= 18 && tmp < 20) {
+
+      LEDT_blink_slow = true;
+      LEDT_blink_fast = false;
+      Tr_ledState = LOW ;
+      Tg_ledState = HIGH ;
+      digitalWrite(Tred_ledPin, Tr_ledState);
+      digitalWrite(Tgreen_ledPin, Tg_ledState);
+
+    } else if (tmp >= 20 && tmp <= 22) {
+      LEDT_blink_slow = false;
+      LEDT_blink_fast = false;
+      Tr_ledState = LOW ;
+      Tg_ledState = HIGH ;
+      digitalWrite(Tred_ledPin, Tr_ledState);
+      digitalWrite(Tgreen_ledPin, Tg_ledState);
+
+    } else if (tmp > 22 && tmp <= 24) {
+
+      LEDT_blink_fast = true ;
+      LEDT_blink_slow = false;
+      Tr_ledState = LOW ;
+      Tg_ledState = HIGH ;
+      digitalWrite(Tred_ledPin, Tr_ledState);
+      digitalWrite(Tgreen_ledPin, Tg_ledState);
+
+    } else if (tmp > 24) {
+
+      LEDT_blink_fast = true ;
+      LEDT_blink_slow = false;
+      Tr_ledState = HIGH ;
+      Tg_ledState = LOW ;
+      digitalWrite(Tred_ledPin, Tr_ledState);
+      digitalWrite(Tgreen_ledPin, Tg_ledState);
+    }
+  }
+} //end of T_myDHTread
+
+int H_myDHTread() {
+  // Reading temperature or humidity takes about 250 milliseconds!
+  // Sensor readings may also be up to 2 seconds 'old' (its a slow sensor)
+  float hum = dht.readHumidity();
+
+  if (isnan(hum)) {
+    Serial.println("Failed to read from humidity from DHT");
+  } else {
+    Serial.print("Humidity: ");
+    Serial.print(hum);
+    Serial.print(" %\t");
+  }
+
+  // PUBlish
+  //note- pass Flash-memory based strings to Serial.print() by wrapping them with F()
+  int hum_pub = hum ; // convert to an integer for publishing
+
+  Serial.print(F("\nSending humidity val "));
+  Serial.print(hum_pub);
+  Serial.print("...");
+  if (! humid.publish(hum_pub)) {
+    Serial.println(F("Humidity Failed"));
+  } else {          // if temp.publish of tmp is successful then print T OK!
+    Serial.println(F("H OK!"));
+  }
+
+  if (LEDHon == false) {
+    Serial.println("H function: LED is OFF");
+    // dont do anything else
+  }
+  else if (LEDHon == true) {
+    Serial.println("H function: LED is ON");
+    //Determine LED colour from Temperature and set the boolean flags to affect blinking behaviour in the loop fn
+    if (hum < 30) {
+
+      LEDH_blink_slow = true;
+      LEDH_blink_fast = false;
+      Hr_ledState = HIGH ;
+      Hg_ledState = LOW ;
+      digitalWrite(Hred_ledPin, Hr_ledState);
+      digitalWrite(Hgreen_ledPin, Hg_ledState);
+
+    } else if (hum >= 30 && hum < 40) {
+
+      LEDH_blink_slow = true;
+      LEDH_blink_fast = false;
+      Hr_ledState = LOW ;
+      Hg_ledState = HIGH ;
+      digitalWrite(Hred_ledPin, Hr_ledState);
+      digitalWrite(Hgreen_ledPin, Hg_ledState);
+
+    } else if (hum >= 40 && hum <= 60) {
+      LEDH_blink_slow = false;
+      LEDH_blink_fast = false;
+      Hr_ledState = LOW ;
+      Hg_ledState = HIGH ;
+      digitalWrite(Hred_ledPin, Hr_ledState);
+      digitalWrite(Hgreen_ledPin, Hg_ledState);
+    } else if (hum > 60 && hum <= 75) {
+
+      LEDH_blink_slow = false;
+      LEDH_blink_fast = true;
+      Hr_ledState = LOW ;
+      Hg_ledState = HIGH ;
+      digitalWrite(Hred_ledPin, Hr_ledState);
+      digitalWrite(Hgreen_ledPin, Hg_ledState);
+
+    } else if (hum > 75) {
+
+      LEDH_blink_fast = true;
+      LEDH_blink_slow = false;
+      Hr_ledState = HIGH ;
+      Hg_ledState = LOW ;
+      digitalWrite(Hred_ledPin, Hr_ledState);
+      digitalWrite(Hgreen_ledPin, Hg_ledState);
+
+    }
+  }
+} //end of H_myDHTread
+
+void Light_read() {
+  // reads the pin from the light sensor (TEMT6000)
+  //int Lux_value = analogRead(light_pin) ;
+  // float volts = Lux_value * 3.3 / 1024.0;
+  //float amps = volts / 10000.0;  // across 10,000 Ohms built in resistor
+  //float microamps = amps * 1000000;
+  //float lux = microamps * 2.0;
+
+  // TSL2561 sensor:
+  /* Get a new light sensor event */
+  sensors_event_t event;
+  tsl.getEvent(&event);
+  /* Display the results (light is measured in lux) */
+  if (event.light)
+  {
+    Serial.print(event.light); Serial.println(" lux");
+    
+  }
+  else
+  {
+    /* If event.light = 0 lux the sensor is probably saturated
+       and no reliable data could be generated! */
+    Serial.println("Sensor overload");
+  }
+  // end of TSL
+
+  Serial.println("Light reading (lux) : ");
+  Serial.println(event.light);
+  int lux = event.light ; // convert to an integer for publishing
+
+  // PUBlish
+  //note- pass Flash-memory based strings to Serial.print() by wrapping them with F()
+  Serial.print(F("\nSending lux val "));
+  Serial.print(lux);
+  Serial.print("...");
+  if (! light.publish(lux)) { // light is the MQTT feed publish variable
+    Serial.println(F("Light publish Failed"));
+  } else {          // if publish of light is successful then print T OK!
+    Serial.println(F("L OK!"));
+  }
+
+  if (LEDLon == false) {
+    Serial.println("L function: LED OFF");
+    // dont do anything else - kept on switching back on
+    //try to turn off directly in here
+    digitalWrite(Lred_ledPin, LOW);
+    digitalWrite(Lgreen_ledPin, LOW);
+  }
+  else if (LEDLon == true) {
+    Serial.println("L function: LED ON");
+    //Determine LED colour from Temperature and set the boolean flags to affect blinking behaviour in the loop fn
+    if (lux < 100) {
+
+      LEDL_blink_slow = true;
+      LEDL_blink_fast = false;
+      Lr_ledState = HIGH ;
+      Lg_ledState = LOW ;
+      digitalWrite(Lred_ledPin, Lr_ledState);
+      digitalWrite(Lgreen_ledPin, Lg_ledState);
+
+    } else if (lux >= 100 && lux < 150) {
+
+      LEDL_blink_slow = true;
+      LEDL_blink_fast = false;
+      Lr_ledState = LOW ;
+      Lg_ledState = HIGH ;
+      digitalWrite(Lred_ledPin, Lr_ledState);
+      digitalWrite(Lgreen_ledPin, Lg_ledState);
+
+    } else if (lux >= 150 && lux <= 300) {
+
+      LEDL_blink_slow = false;
+      LEDL_blink_fast = false;
+      Lr_ledState = LOW ;
+      Lg_ledState = HIGH ;
+      digitalWrite(Lred_ledPin, Lr_ledState);
+      digitalWrite(Lgreen_ledPin, Lg_ledState);
+
+    } else if (lux > 300 && lux <= 500) {
+
+      LEDL_blink_fast = true;
+      LEDL_blink_slow = false;
+      Lr_ledState = LOW ;
+      Lg_ledState = HIGH ;
+      digitalWrite(Lred_ledPin, Lr_ledState);
+      digitalWrite(Lgreen_ledPin, Lg_ledState);
+    } else if (lux > 500) {
+
+      LEDL_blink_fast = true;
+      LEDL_blink_slow = false;
+      Lr_ledState = HIGH ;
+      Lg_ledState = LOW ;
+      digitalWrite(Lred_ledPin, Lr_ledState);
+      digitalWrite(Lgreen_ledPin, Lg_ledState);
+    }
+  }
+} // end of light fn
+
+// Function to connect and reconnect as necessary to the MQTT server.
+// Should be called in the loop function and it will take care if connecting.
+void MQTT_connect() {
+  int8_t ret;
+  // Stop if already connected.
+  if (mqtt.connected()) {
+    return;
+  }
+  Serial.print("Connecting to MQTT... ");
+  uint8_t retries = 3;
+  while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
+    Serial.println(mqtt.connectErrorString(ret));
+    Serial.println("Retrying MQTT connection in 5 seconds...");
+    mqtt.disconnect();
+    delay(5000);  // wait 5 seconds
+    retries--;
+    if (retries == 0) {
+      // basically die and wait for WDT to reset me
+      while (1);
+    }
+  }
+  Serial.println("MQTT Connected!");
+}
